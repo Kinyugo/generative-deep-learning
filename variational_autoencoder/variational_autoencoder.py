@@ -1,20 +1,11 @@
-from operator import itemgetter
-from typing import Callable, List, Union, Tuple, TypedDict
+from typing import Callable, List, Union, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 _size_2_t = Union[int, Tuple[int, int]]
 _list_size_2_t = List[_size_2_t]
-
-
-class EncoderOutputType(TypedDict):
-    """
-    Type annotations for the encoder output
-    """
-    sampled_points: torch.TensorType
-    conv_output_shape: Tuple[int, int, int, int]
+_tensor_size_3_t = Tuple[torch.TensorType, torch.TensorType, torch.TensorType]
 
 
 class Lambda(nn.Module):
@@ -156,10 +147,6 @@ class Encoder(nn.Module):
             outputs the mean of the distribution 
         - `Linear`:
             outputs the logarithmic variance of the distribution
-        - `Lambda`(Output Layer):
-            takes the mean and logarithmic variance of the distribution and 
-            samples points from this using the formula:
-                `sample = mean + standard_deviation * epsilon`
     """
     def __init__(self,
                  in_channels: List[int],
@@ -196,16 +183,7 @@ class Encoder(nn.Module):
         self.mean_layer = nn.Linear(latent_dim, latent_dim)
         self.log_variance_layer = nn.Linear(latent_dim, latent_dim)
 
-        self.sampling_layer = Lambda(self.sample)
-
-    def sample(self, args: List[torch.TensorType]):
-        mean, log_variance = args
-        epsilon = torch.randn_like(mean)
-        standard_deviation = torch.exp(log_variance / 2)
-
-        return mean + standard_deviation * epsilon
-
-    def forward(self, x: torch.TensorType) -> EncoderOutputType:
+    def forward(self, x: torch.TensorType) -> _tensor_size_3_t:
         # perform a forward pass through the convolutional blocks
         conv_blocks_output = self.conv_blocks(x)
         # the shape of the convolutional blocks is required later for
@@ -220,15 +198,7 @@ class Encoder(nn.Module):
         mean = self.mean_layer(reshaped_conv_blocks_output)
         log_variance = self.log_variance_layer(reshaped_conv_blocks_output)
 
-        # sample from a normal distribution defined by the mean and standard_deviation
-        sampled_points = self.sampling_layer([mean, log_variance])
-
-        encoder_output: EncoderOutputType = {
-            'sampled_points': sampled_points,
-            'conv_output_shape': conv_blocks_output_shape
-        }
-
-        return encoder_output
+        return mean, log_variance, conv_blocks_output_shape
 
 
 class Decoder(nn.Module):
@@ -283,7 +253,7 @@ class Decoder(nn.Module):
 
         self.decoder = nn.Sequential(*conv_transpose_blocks, output_block)
 
-    def forward(self, x: torch.TensorType) -> torch.TensorType:
+    def forward(self, x: torch.TensorType) -> TensorType:
         return self.decoder(x)
 
 
@@ -304,14 +274,11 @@ class VariationalAutoEncoder(nn.Module):
             outputs the mean of the distribution 
         - `Linear`:
             outputs the logarithmic variance of the distribution
-        - `Lambda`(Output Layer):
-            takes the mean and logarithmic variance of the distribution and 
-            samples points from this using the formula:
 
+    - `Lambda`(Sampling Layer):
+        takes the mean and logarithmic variance of the distribution and 
+        samples points from this using the formula:
             `sample = mean + standard_deviation * epsilon`
-    - `Linear`: 
-        Takes output from the Encoder and applies the linear function. 
-
     - `Decoder`:
         Takes a point from the latent space and outputs an image.
         Consists of:
@@ -396,7 +363,7 @@ class VariationalAutoEncoder(nn.Module):
                                use_dropout=use_dropout,
                                dropout_rate=dropout_rate)
 
-        self.decoder_input_layer = nn.Linear(latent_dim, latent_dim)
+        self.sampling_layer = Lambda(self.sample)
 
         self.decoder = Decoder(in_channels=dec_in_channels,
                                out_channels=dec_out_channels,
@@ -408,21 +375,29 @@ class VariationalAutoEncoder(nn.Module):
                                use_dropout=use_dropout,
                                dropout_rate=dropout_rate)
 
-    def forward(self, x) -> torch.TensorType:
+    def forward(self, x) -> _tensor_size_3_t:
 
         # perform a forward pass through the encoder
-        encoder_output: EncoderOutputType = self.encoder(x)
         # extract the contents of the encoder output
-        sampled_points, conv_output_shape = itemgetter(
-            'sampled_points', 'conv_output_shape')(encoder_output)
+        mean, log_variance, conv_output_shape = self.encoder(x)
 
-        # pass the sampled points through the decoder input
-        dec_input = self.decoder_input_layer(sampled_points)
+        # using the mean and log_variance sample points
+        sampled_points = self.sampling_layer([mean, log_variance])
+
         # reshape the decoder input to the shape of the output of the Conv2d layers in
         # the encoder
-        reshaped_dec_input = dec_input.view(conv_output_shape)
+        decoder_input = sampled_points.view(conv_output_shape)
 
-        return self.decoder(reshaped_dec_input)
+        decoder_output = self.decoder(decoder_input)
+
+        return mean, log_variance, decoder_output
+
+    def sample(self, args: List[torch.TensorType]):
+        mean, log_variance = args
+        epsilon = torch.randn_like(mean)
+        standard_deviation = torch.exp(log_variance / 2)
+
+        return mean + standard_deviation * epsilon
 
 
 if __name__ == "__main__":
@@ -448,4 +423,8 @@ if __name__ == "__main__":
     sample_variational_auto_encoder_out = sample_variational_auto_encoder(
         sample_variational_auto_encoder_inp)
 
-    print(sample_variational_auto_encoder_out.size())
+    mean, log_variance, decoder_output = sample_variational_auto_encoder_out
+
+    print(f'Mean shape: {mean.size()}')
+    print(f'Logarithmic Variance shape: {log_variance.size()}')
+    print(f'Decoder output shape: {decoder_output.shape}')
