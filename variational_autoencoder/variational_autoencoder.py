@@ -253,7 +253,7 @@ class Decoder(nn.Module):
 
         self.decoder = nn.Sequential(*conv_transpose_blocks, output_block)
 
-    def forward(self, x: torch.TensorType) -> TensorType:
+    def forward(self, x: torch.TensorType) -> torch.TensorType:
         return self.decoder(x)
 
 
