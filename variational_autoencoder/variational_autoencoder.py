@@ -1,4 +1,4 @@
-from typing import Callable, List, Union, Tuple
+from typing import Any, Callable, List, Union, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,16 +10,52 @@ _tensor_size_3_t = Tuple[torch.TensorType, torch.TensorType, torch.TensorType]
 
 class Lambda(nn.Module):
     """
-    Implements a keras like Lambda layer, 
-    that wraps a function into a composable module.
+    Implements a keras like Lambda layer 
+    that wraps a function into a module making
+    it composable.
     """
-    def __init__(self, function: Callable = lambda x: x):
+    def __init__(self, function: Callable = lambda x: x) -> None:
         super(Lambda, self).__init__()
 
         self.function = function
 
-    def forward(self, x: torch.TensorType):
+    def forward(self, x: torch.TensorType) -> Any:
         return self.function(x)
+
+
+class Flatten(nn.Module):
+    """
+    Implements a keras like Flatten layer,
+    where only the batch dimension is maintained 
+    and all the other dimensions are flattened. 
+    i.e reshapes a tensor from (N, *,...) -> (N, product_of_other_dimensions)
+    """
+    def __init__(self) -> None:
+        super(Flatten, self).__init__()
+
+    def forward(self, x: torch.TensorType) -> torch.TensorType:
+        # maintain the batch dimension
+        # and concatenate all other dimensions
+        return torch.flatten(x, start_dim=1)
+
+
+class UnFlatten(nn.Module):
+    """
+    Implements a reshape operation that transforms a 2d
+    tensor into a 4d tensor. 
+    i.e reshapes a tensor from (N, channels * width * height) -> (N, channels, width, height)
+    """
+    def __init__(self, num_channels: int) -> None:
+        super(UnFlatten, self).__init__()
+
+        self.num_channels = num_channels
+
+    def forward(self, x: torch.TensorType) -> torch.TensorType:
+        batch_size = x.size(0)
+        width_height_dim = int((x.size(1) // self.num_channels)**0.5)
+
+        return torch.reshape(x, (batch_size, self.num_channels,
+                                 width_height_dim, width_height_dim))
 
 
 class ConvBlock(nn.Module):
@@ -134,19 +170,17 @@ class ConvTransposeBlock(nn.Module):
 
 class Encoder(nn.Module):
     """
-    The Encoder takes an image and maps it into a multivariate normal distribution. 
-    In one dimension the distribution is defined by the mean and the variance. 
+    The Encoder takes a data point and applies convolutional 
+    operations to it.
+    Implements a sequential stack of ConvBlock(s).
 
-    The Encoder then outputs two values mean and logarithmic variance, which together 
-    define a multivariate distribution in the latent space. 
+    Consists of:
 
-    The Encoder consists of: 
-        - `ConvBlock`(s):
-            carries out the convolutional operations 
-        - `Linear`: 
-            outputs the mean of the distribution 
-        - `Linear`:
-            outputs the logarithmic variance of the distribution
+    - `ConvBlock`(s):
+        carries out the convolutional operations
+    - `Flatten`:
+        reshapes the 4d output tensor of the convolutional layers 
+        into 2d tensor
     """
     def __init__(self,
                  in_channels: List[int],
@@ -154,17 +188,14 @@ class Encoder(nn.Module):
                  kernel_sizes: _list_size_2_t,
                  strides: _list_size_2_t,
                  paddings: _list_size_2_t,
-                 latent_dim: int = 2,
-                 use_batchnorm: bool = False,
+                 use_batch_norm: bool = False,
                  use_dropout: bool = False,
-                 dropout_rate: float = 0.25):
+                 dropout_rate: float = 0.25) -> None:
         super(Encoder, self).__init__()
 
-        # latent_dim(latent dimension) is required for reshape operations
-        self.latent_dim = latent_dim
-
+        # initialize conv blocks
         conv_blocks = nn.ModuleList()
-        # append ConvBlock(s) with their configuration
+        # append ConvBlock(s) whith their configuration
         for i in range(len(kernel_sizes)):
             conv_blocks.append(
                 ConvBlock(in_channels=in_channels[i],
@@ -172,48 +203,100 @@ class Encoder(nn.Module):
                           kernel_size=kernel_sizes[i],
                           stride=strides[i],
                           padding=paddings[i],
-                          use_batchnorm=use_batchnorm,
+                          use_batchnorm=use_batch_norm,
                           use_dropout=use_dropout,
                           dropout_rate=dropout_rate))
 
         self.conv_blocks = nn.Sequential(*conv_blocks)
+        self.flatten = Flatten()
 
-        # for reshape purposes output layers take in input the same shape as latent dimension
-        # and outputs the same shape as the latent dimension
-        self.mean_layer = nn.Linear(latent_dim, latent_dim)
-        self.log_variance_layer = nn.Linear(latent_dim, latent_dim)
+    def forward(self, x: torch.TensorType) -> torch.TensorType:
+        # perform a forward pass through the convolutional blocks
+        # (N, C, W, H) -> (N, C, W, H)
+        conv_blocks_output = self.conv_blocks(x)
+
+        # flatten the output from the conv_blocks
+        # (N, C, W, H) -> (N, C * W * H)
+        return self.flatten(conv_blocks_output)
+
+
+class BottleNeck(nn.Module):
+    """
+    Implements the layers that output parameters defining the 
+    latent space as well as the sampling points from the latent space.
+
+    The BottleNeck consists of:
+
+    - `Linear`(Mean Layer):
+        takes in features extracted by the encoder and outputs the mean of the
+        latent space distribution.
+    - `Linear`(Log Variance Layer):
+        takes in features extracted by the encoder and outputs the logarithmic variance
+        of the latent space distribution
+    - `Lambda`(Reparametarization/Sampling Layer):
+        takes the mean and logarithmic variance of the distribution and 
+        samples points from this using the formula:
+        `sample = mean + standard_deviation * epsilon`
+        where epsilon is drawn from a standard normal distribution i.e `epsilon ~ N(0, I)`
+    """
+    def __init__(self, latent_dim: int, hidden_dim: int) -> None:
+        super(BottleNeck, self).__init__()
+
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_log_variance = nn.Linear(hidden_dim, latent_dim)
+        self.sampling = Lambda(self.sample)
 
     def forward(self, x: torch.TensorType) -> _tensor_size_3_t:
-        # perform a forward pass through the convolutional blocks
-        conv_blocks_output = self.conv_blocks(x)
-        # the shape of the convolutional blocks is required later for
-        # reshape operations in the encoder
-        conv_blocks_output_shape = conv_blocks_output.size()
+        # outputs the mean of the distribution
+        # mu: (N, latent_dim)
+        mu = self.fc_mu(x)
+        # outputs the log_variace of the distribution
+        # log_variance: (N, latent_dim)
+        log_variance = self.fc_log_variance(x)
 
-        # reshape the output from the convolutional blocks to a valid shape
-        # for the mean and log_variance layers
-        reshaped_conv_blocks_output = conv_blocks_output.view(
-            -1, self.latent_dim)
+        # sample z from a distribution
+        z = self.sampling([mu, log_variance])
 
-        mean = self.mean_layer(reshaped_conv_blocks_output)
-        log_variance = self.log_variance_layer(reshaped_conv_blocks_output)
+        return z, mu, log_variance
 
-        return mean, log_variance, conv_blocks_output_shape
+    def sample(self, args):
+        mu, log_variance = args
+
+        std = torch.exp(log_variance / 2)
+        # define a distribution q with the parameters mu and std
+        q = torch.distributions.Normal(mu, std)
+        # sample z from q
+        z = q.rsample()
+
+        return z
 
 
 class Decoder(nn.Module):
     """
-    The Decoder takes a point the latent space and outputs an image.
+    The Decoder takes a sampled point from the latent space and reconstructs 
+    a data point from the sampled point. 
 
-    The Decoder consists of:
+    The Decoder consists of: 
 
-        - `ConvTransposeBlock`(s):
-            carries out the transposed convolutional operation
-        - OutputLayer:
-            - `ConvTranspose2d`:
-                for the transposed convolutiona operation 
-            - `Sigmoid`:
-                activation for the output layer
+    - `Linear`(Decoder Input): 
+        takes the sampled point and applies a linear transformation to it. 
+        This is necessary for reshape operation that is carried out after this layer
+        to make sure that the input shape to the ConvTranspose2d layer of the Decoder matches
+        the shape of the last Conv2d layer in the Encoder.
+    - `UnFlatten`:
+        takes a 2d tensor and reshapes it into a 4d tensor. 
+        In this case the sampled points are reshaped into a shape that
+        can be passed into the ConvTransposeBlock(s).
+    - `ConvTransposeBlock`(s):
+        carries out the transposed convolutional operation as well as 
+        regularization by using batch normalization and dropout layers.
+    - OutputBlock: 
+
+        - `ConvTranspose2d`:
+            carries out the transposed convolutional operation.
+        - `Sigmoid`:
+            activation for the output layer. 
+            Maps the tensors to the range [0, 1].
     """
     def __init__(self,
                  in_channels: List[int],
@@ -222,13 +305,24 @@ class Decoder(nn.Module):
                  strides: _list_size_2_t,
                  paddings: _list_size_2_t,
                  output_paddings: _list_size_2_t,
-                 use_batchnorm: bool = False,
+                 latent_dim: int,
+                 hidden_dim: int,
+                 use_batch_norm: bool = False,
                  use_dropout: bool = False,
                  dropout_rate: float = 0.25) -> None:
         super(Decoder, self).__init__()
 
+        self.decoder_input = nn.Linear(latent_dim, hidden_dim)
+
+        # number of channels should match the number of
+        # channels of the first ConvTranspose2d layer
+        self.unflatten = UnFlatten(in_channels[0])
+
+        # initialize conv_transpose blocks
         conv_transpose_blocks = nn.ModuleList()
         # append ConvTransposeBlock(s) with their configuration
+        # the last configuration is used for the output layer and thus
+        # excluded from the list.
         for i in range(len(kernel_sizes) - 1):
             conv_transpose_blocks.append(
                 ConvTransposeBlock(in_channels=in_channels[i],
@@ -237,12 +331,12 @@ class Decoder(nn.Module):
                                    stride=strides[i],
                                    padding=paddings[i],
                                    output_padding=output_paddings[i],
-                                   use_batchnorm=use_batchnorm,
+                                   use_batchnorm=use_batch_norm,
                                    use_dropout=use_dropout,
                                    dropout_rate=dropout_rate))
+        self.conv_transpose_blocks = nn.Sequential(*conv_transpose_blocks)
 
-        # contains a ConvTranspose2d layer and Sigmoid activation layer.
-        output_block = nn.Sequential(
+        self.output_block = nn.Sequential(
             nn.ConvTranspose2d(in_channels=in_channels[-1],
                                out_channels=out_channels[-1],
                                kernel_size=kernel_sizes[-1],
@@ -251,45 +345,86 @@ class Decoder(nn.Module):
                                output_padding=output_paddings[-1]),
             nn.Sigmoid())
 
-        self.decoder = nn.Sequential(*conv_transpose_blocks, output_block)
-
     def forward(self, x: torch.TensorType) -> torch.TensorType:
-        return self.decoder(x)
+        # perform a linear transformation on the input
+        # (N, latent_dim) -> (N, hidden_dim)
+        x = self.decoder_input(x)
+
+        # reshape the decoders input
+        # (N, hidden_dim) -> (N, C, W, H)
+        x = self.unflatten(x)
+
+        # perform a forward pass through the conv_transpose_blocks
+        # (N, C_in, W_in, H_in) -> (N, C_out, W_out, H_out)
+        conv_transpose_output = self.conv_transpose_blocks(x)
+
+        # perform a forward pass through the output block
+        # (N, C_in, W_in, H_in) -> (N, C_out, W_out, H_out)
+        return self.output_block(conv_transpose_output)
 
 
 class VariationalAutoEncoder(nn.Module):
     """
-    The VariationalAutoEncoder takes an image passes it through an Encoder that maps the input image
-    into a multivariate normal distribution in the latent space and then a Decoder that samples from this
-    distribution and outputs an image. 
+    The VariationalAutoEncoder takes a data point, passes it through an Encoder,
+    and outputs mean and log variance of a multivariate gaussian distribution in the latent space. 
+    The Encoder models the conditional distribution p(z|x).
 
-    The VariationalAutoEncoder consists of: 
+    Using the mean and log variance the reparameterization trick is then applied 
+    to sample a point from the normal distribution defined by the mean and variance. 
 
-    - `Encoder`: 
-        Takes an input image and maps it to a latent space.
-        Consists of: 
-        - `ConvBlock`(s):
-            carries out the convolutional operations 
-        - `Linear`: 
-            outputs the mean of the distribution 
-        - `Linear`:
-            outputs the logarithmic variance of the distribution
+    The sampled point is then passed through the Decoder that then attempts to reconstruct
+    a data point from the sampled point. 
+    The Decoder models the conditional distribution p(x|z).
 
-    - `Lambda`(Sampling Layer):
-        takes the mean and logarithmic variance of the distribution and 
-        samples points from this using the formula:
-            `sample = mean + standard_deviation * epsilon`
-    - `Decoder`:
-        Takes a point from the latent space and outputs an image.
+    The VariationalAutoEncoder consists of:
+
+    - `Encoder`:
+        Extracts meaningful features from the data.
         Consists of:
+
+        - `ConvBlock`(s):
+        carries out the convolutional operations
+        - `Flatten`:
+            reshapes the 4d output tensor of the convolutional layers 
+            into 2d tensor
+    - `BottleNeck`:
+        Models the latent space of the VariationalAutoEncoder, and 
+        samples points from this latent space.
+
+        - `Linear`(Mean Layer):
+            takes in features extracted by the encoder and outputs the mean of the
+            latent space distribution.
+        - `Linear`(Log Variance Layer):
+            takes in features extracted by the encoder and outputs the logarithmic variance
+            of the latent space distribution
+        - `Lambda`(Reparametarization/Sampling Layer):
+            takes the mean and logarithmic variance of the distribution and 
+            samples points from this using the formula:
+            `sample = mean + standard_deviation * epsilon`
+            where epsilon is drawn from a standard normal distribution i.e `epsilon ~ N(0, I)`
+    - `Decoder`: 
+        takes a point sampled from the latent space and reconstructs a data point.
+        Consists of:
+
+        - `Linear`(Decoder Input): 
+            takes the sampled point and applies a linear transformation to it. 
+            This is necessary for reshape operation that is carried out after this layer
+            to make sure that the input shape to the ConvTranspose2d layer of the Decoder matches
+            the shape of the last Conv2d layer in the Encoder.
+        - `UnFlatten`:
+            takes a 2d tensor and reshapes it into a 4d tensor. 
+            In this case the sampled points are reshaped into a shape that
+            can be passed into the ConvTransposeBlock(s).
         - `ConvTransposeBlock`(s):
-            carries out the transposed convolutional operation
-        - OutputLayer:
+            carries out the transposed convolutional operation as well as 
+            regularization by using batch normalization and dropout layers.
+        - OutputBlock: 
+
             - `ConvTranspose2d`:
-                for the transposed convolutiona operation 
+                carries out the transposed convolutional operation.
             - `Sigmoid`:
-                activation for the output layer
-     
+                activation for the output layer. 
+                Maps the tensors to the range [0, 1].
     """
     def __init__(self,
                  enc_in_channels: List[int],
@@ -303,8 +438,9 @@ class VariationalAutoEncoder(nn.Module):
                  dec_strides: _list_size_2_t,
                  dec_paddings: _list_size_2_t,
                  dec_output_paddings: _list_size_2_t,
-                 latent_dim: int,
-                 use_batchnorm: bool = False,
+                 latent_dim: int = 2,
+                 data_dim: int = 512,
+                 use_batch_norm: bool = False,
                  use_dropout: bool = False,
                  dropout_rate: float = 0.25) -> None:
         """
@@ -341,6 +477,9 @@ class VariationalAutoEncoder(nn.Module):
             Can be a single integer e.g: `2` or a tuple e.g: `(2, 2)`
         - `latent_dim : int`
             Dimension of the latent space.
+        - `data_dim : int`
+            Dimension of the input data point. i.e for an image this would be
+            the height and width of the image.
         - `use_batch_norm : bool`
             Determines whether BatchNorm2d layers will be included after each of
             the convolutional layers
@@ -353,78 +492,83 @@ class VariationalAutoEncoder(nn.Module):
         """
         super(VariationalAutoEncoder, self).__init__()
 
+        # instantiate the encoder part.
         self.encoder = Encoder(in_channels=enc_in_channels,
                                out_channels=enc_out_channels,
                                kernel_sizes=enc_kernel_sizes,
                                strides=enc_strides,
                                paddings=enc_paddings,
-                               latent_dim=latent_dim,
-                               use_batchnorm=use_batchnorm,
+                               use_batch_norm=use_batch_norm,
                                use_dropout=use_dropout,
                                dropout_rate=dropout_rate)
 
-        self.sampling_layer = Lambda(self.sample)
+        # to calculate the hidden dim the size of the last dimension
+        # of the encoder must be known, hence a sample forward pass is
+        # done on the encoder to determine this.
+        sample_input = torch.randn((1, enc_in_channels[0], data_dim, data_dim))
+        hidden_dim = self.encoder(sample_input).size(-1)
 
+        # initialize the bottleneck layer
+        self.bottle_neck = BottleNeck(latent_dim, hidden_dim)
+
+        # initalize the decoder
         self.decoder = Decoder(in_channels=dec_in_channels,
                                out_channels=dec_out_channels,
                                kernel_sizes=dec_kernel_sizes,
                                strides=dec_strides,
                                paddings=dec_paddings,
                                output_paddings=dec_output_paddings,
-                               use_batchnorm=use_batchnorm,
+                               latent_dim=latent_dim,
+                               hidden_dim=hidden_dim,
+                               use_batch_norm=use_batch_norm,
                                use_dropout=use_dropout,
                                dropout_rate=dropout_rate)
 
-    def forward(self, x) -> _tensor_size_3_t:
+    def forward(self, x: torch.TensorType) -> _tensor_size_3_t:
+        # extract meaningful features from the data
+        # by  performing a forward pass through the encoder
+        encoder_output = self.encoder(x)
 
-        # perform a forward pass through the encoder
-        # extract the contents of the encoder output
-        mean, log_variance, conv_output_shape = self.encoder(x)
+        # using features extracted from the data obtain mean and log_variance
+        # that will be used to define the distribution of the latent space.
+        # perform a forward pass through the bottle neck
+        z, mu, log_variance = self.bottle_neck(encoder_output)
 
-        # using the mean and log_variance sample points
-        sampled_points = self.sampling_layer([mean, log_variance])
+        # reconstruct the data points from by using the sampled points
+        # by performing a forward pass through the decoder.
+        x_hat = self.decoder(z)
 
-        # reshape the decoder input to the shape of the output of the Conv2d layers in
-        # the encoder
-        decoder_input = sampled_points.view(conv_output_shape)
-
-        decoder_output = self.decoder(decoder_input)
-
-        return mean, log_variance, decoder_output
-
-    def sample(self, args: List[torch.TensorType]):
-        mean, log_variance = args
-        epsilon = torch.randn_like(mean)
-        standard_deviation = torch.exp(log_variance / 2)
-
-        return mean + standard_deviation * epsilon
+        return z, mu, log_variance, x_hat
 
 
 if __name__ == "__main__":
+    vae = VariationalAutoEncoder(enc_in_channels=[3, 32, 64],
+                                 enc_out_channels=[32, 64, 128],
+                                 enc_kernel_sizes=[3, 3, 3],
+                                 enc_strides=[1, 2, 1],
+                                 enc_paddings=[1, 1, 1],
+                                 dec_in_channels=[128, 64, 32],
+                                 dec_out_channels=[64, 32, 3],
+                                 dec_kernel_sizes=[3, 3, 3],
+                                 dec_strides=[1, 2, 1],
+                                 dec_paddings=[1, 1, 1],
+                                 dec_output_paddings=[0, 1, 0],
+                                 latent_dim=16,
+                                 data_dim=32,
+                                 use_batch_norm=True,
+                                 use_dropout=True,
+                                 dropout_rate=0.20)
+    print(vae)
 
-    sample_variational_auto_encoder = VariationalAutoEncoder(
-        enc_in_channels=[3, 16, 32],
-        enc_out_channels=[16, 32, 64],
-        enc_kernel_sizes=[3, 3, 7],
-        enc_strides=[1, 2, 1],
-        enc_paddings=[1, 1, 1],
-        dec_in_channels=[64, 32, 16],
-        dec_out_channels=[32, 16, 3],
-        dec_kernel_sizes=[7, 3, 3],
-        dec_strides=[1, 2, 1],
-        dec_paddings=[1, 1, 1],
-        dec_output_paddings=[0, 1, 0],
-        latent_dim=2,
-        use_batchnorm=True,
-        use_dropout=True)
-    print(sample_variational_auto_encoder)
+    vae_input = torch.randn((1, 3, 32, 32))
+    z, mu, log_variance, x_hat = vae(vae_input)
 
-    sample_variational_auto_encoder_inp = torch.randn((1, 3, 1366, 720))
-    sample_variational_auto_encoder_out = sample_variational_auto_encoder(
-        sample_variational_auto_encoder_inp)
+    def count_model_parameters(model: nn.Module):
+        return sum(param.numel() for param in model.parameters()
+                   if param.requires_grad)
 
-    mean, log_variance, decoder_output = sample_variational_auto_encoder_out
-
-    print(f'Mean shape: {mean.size()}')
-    print(f'Logarithmic Variance shape: {log_variance.size()}')
-    print(f'Decoder output shape: {decoder_output.shape}')
+    print(f'Z shape: {z.size()}')
+    print(f'Mean Shape: {mu.size()}')
+    print(f'Log variance shape: {log_variance.size()}')
+    print(f'X_hat shape: {x_hat.size()}')
+    print(f'Number of model parameters: {count_model_parameters(vae)}')
